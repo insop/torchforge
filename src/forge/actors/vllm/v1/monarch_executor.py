@@ -15,7 +15,6 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import cloudpickle
 from monarch.actor import Actor, context, endpoint
-from monarch.tools.network import get_ipaddr
 from vllm.v1.executor.abstract import Executor
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
@@ -23,19 +22,87 @@ logger = logging.getLogger(__name__)
 
 
 def _get_host_ip() -> str:
-    """Get this host's routable IP address using hostname resolution.
+    """Get this host's routable IPv4 address.
 
-    Uses socket.gethostname() + DNS resolution, which works on internal
-    networks where external IPs (like 8.8.8.8) are unreachable.
+    Tries multiple methods in order of preference:
+    1. VLLM_HOST_IP environment variable (explicit override)
+    2. MASTER_ADDR environment variable (PyTorch distributed convention)
+    3. Hostname DNS resolution (filtering for IPv4)
+    4. Network interface inspection (finds first non-loopback IPv4)
+    5. Loopback fallback (127.0.0.1 for single-node)
+
+    Works in Docker containers, native environments, and multi-node setups.
     """
     import socket
 
+    # 1. Explicit override via environment variable
     if host_ip := os.environ.get("VLLM_HOST_IP"):
         return host_ip
 
+    # 2. Use MASTER_ADDR if set (common in distributed setups)
+    if master_addr := os.environ.get("MASTER_ADDR"):
+        # Validate it's not a hostname that needs resolution
+        try:
+            socket.inet_aton(master_addr)  # Validates IPv4 format
+            return master_addr
+        except socket.error:
+            pass  # Not a valid IPv4, continue to other methods
+
+    # 3. Try hostname resolution, filtering for IPv4 addresses
     hostname = socket.gethostname()
-    # Use Monarch's get_ipaddr which resolves hostname via DNS
-    return get_ipaddr(hostname, 0)
+    try:
+        # getaddrinfo returns all addresses; filter for IPv4 (AF_INET)
+        addrs = socket.getaddrinfo(hostname, None, socket.AF_INET, socket.SOCK_STREAM)
+        for addr_info in addrs:
+            ip = addr_info[4][0]
+            # Skip loopback unless it's our only option
+            if not ip.startswith("127."):
+                return ip
+    except socket.gaierror:
+        pass  # Hostname resolution failed, continue
+
+    # 4. Inspect network interfaces for non-loopback IPv4
+    try:
+        import subprocess
+
+        # Use ip command (Linux) to get IPv4 addresses
+        result = subprocess.run(
+            ["ip", "-4", "addr", "show"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if result.returncode == 0:
+            import re
+
+            # Match inet addresses, excluding loopback
+            for line in result.stdout.splitlines():
+                match = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", line)
+                if match:
+                    ip = match.group(1)
+                    if not ip.startswith("127."):
+                        return ip
+    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+        pass  # ip command not available or failed
+
+    # 5. Try connecting to a local address to determine outbound interface IP
+    try:
+        # This doesn't actually connect, just determines the interface
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            # Use a non-routable address; connect() won't send packets
+            s.connect(("10.255.255.255", 1))
+            ip = s.getsockname()[0]
+            if not ip.startswith("127."):
+                return ip
+    except Exception:
+        pass
+
+    # 6. Final fallback: loopback (works for single-node training)
+    logger.warning(
+        "[MonarchExecutor] Could not determine host IPv4 address, "
+        "falling back to 127.0.0.1. Set VLLM_HOST_IP for multi-node."
+    )
+    return "127.0.0.1"
 
 
 def _get_free_port() -> int:
